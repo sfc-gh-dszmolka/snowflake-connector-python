@@ -983,7 +983,7 @@ class SnowflakeConnection:
         if self.client_session_keep_alive_heartbeat_frequency is not None:
             self._session_parameters[
                 PARAMETER_CLIENT_SESSION_KEEP_ALIVE_HEARTBEAT_FREQUENCY
-            ] = self._validate_client_session_keep_alive_heartbeat_frequency()
+            ] = self._validate_client_session_keep_alive_heartbeat_frequency()[0]
 
         if self.client_prefetch_threads:
             self._session_parameters[PARAMETER_CLIENT_PREFETCH_THREADS] = (
@@ -1668,9 +1668,11 @@ class SnowflakeConnection:
             self._telemetry.try_add_log_to_batch(telemetry_data)
 
     def _add_heartbeat(self) -> None:
-        """Add an hourly heartbeat query in order to keep connection alive."""
+        """Add a periodic heartbeat query in order to keep connection alive."""
         if not self.heartbeat_thread:
-            self._validate_client_session_keep_alive_heartbeat_frequency()
+            _client_hb_freq = (
+                self._validate_client_session_keep_alive_heartbeat_frequency()[1]
+            )
             heartbeat_wref = weakref.WeakMethod(self._heartbeat_tick)
 
             def beat_if_possible() -> None:
@@ -1679,11 +1681,11 @@ class SnowflakeConnection:
                     heartbeat_fn()
 
             self.heartbeat_thread = HeartBeatTimer(
-                self.client_session_keep_alive_heartbeat_frequency,
+                _client_hb_freq,
                 beat_if_possible,
             )
             self.heartbeat_thread.start()
-            logger.debug("started heartbeat")
+            logger.debug("started heartbeat with %s second frequency", _client_hb_freq)
 
     def _cancel_heartbeat(self) -> None:
         """Cancel a heartbeat thread."""
@@ -1694,30 +1696,65 @@ class SnowflakeConnection:
             logger.debug("stopped heartbeat")
 
     def _heartbeat_tick(self) -> None:
-        """Execute a hearbeat if connection isn't closed yet."""
+        """Execute a heartbeat if connection isn't closed yet."""
         if not self.is_closed():
             logger.debug("heartbeating!")
             self.rest._heartbeat()
 
-    def _validate_client_session_keep_alive_heartbeat_frequency(self) -> int:
+    def _validate_client_session_keep_alive_heartbeat_frequency(
+        self,
+    ) -> tuple[int, int]:
         """Validate and return heartbeat frequency in seconds."""
         real_max = int(self.rest.master_validity_in_seconds / 4)
         real_min = int(real_max / 4)
 
         # ensure the type is integer
-        self._client_session_keep_alive_heartbeat_frequency = int(
-            self.client_session_keep_alive_heartbeat_frequency
-        )
+        try:
+            self._client_session_keep_alive_heartbeat_frequency = int(
+                self.client_session_keep_alive_heartbeat_frequency
+            )
+        except TypeError:
+            # this shouldn't happen. if we couldn't convert it to int, then it was likely None
+            self._client_session_keep_alive_heartbeat_frequency = None
 
-        if self.client_session_keep_alive_heartbeat_frequency is None:
-            # This is an unlikely scenario but covering it just in case.
-            self._client_session_keep_alive_heartbeat_frequency = real_min
-        elif self.client_session_keep_alive_heartbeat_frequency > real_max:
-            self._client_session_keep_alive_heartbeat_frequency = real_max
-        elif self.client_session_keep_alive_heartbeat_frequency < real_min:
-            self._client_session_keep_alive_heartbeat_frequency = real_min
+        def _get_hb_minmax(hb_in_config: int | None) -> tuple[int, int]:
+            one_minute = 60
+            if hb_in_config is None:
+                logger.debug(
+                    "heartbeat frequency somehow set to None, adjusting to %s seconds.",
+                    real_min,
+                )
+                return real_min, real_min
+            elif hb_in_config > real_max:
+                logger.debug(
+                    "heartbeat frequency (%s) set too high, adjusting to %s",
+                    hb_in_config,
+                    real_max,
+                )
+                return real_max, real_max
+            elif hb_in_config < one_minute:
+                logger.debug(
+                    "heartbeat frequency (%s) set too low, configuring session parameter to %s,"
+                    " will heartbeat every %s seconds.",
+                    hb_in_config,
+                    real_min,
+                    one_minute,
+                )
+                return real_min, one_minute
+            elif hb_in_config < real_min:
+                logger.debug(
+                    "heartbeat frequency (%s) set lower than allowed in session, configuring session parameter"
+                    " to %s, will heartbeat every %s seconds.",
+                    hb_in_config,
+                    real_min,
+                    hb_in_config,
+                )
+                return real_min, hb_in_config
+            else:
+                logger.debug("heartbeat frequency set to %s", hb_in_config)
+                return hb_in_config, hb_in_config
 
-        return self.client_session_keep_alive_heartbeat_frequency
+        return _get_hb_minmax(self._client_session_keep_alive_heartbeat_frequency)
 
     def _validate_client_prefetch_threads(self) -> int:
         if self.client_prefetch_threads <= 0:
